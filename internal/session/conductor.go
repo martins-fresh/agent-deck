@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	ConductorAgentClaude = "claude"
-	ConductorAgentCodex  = "codex"
-	ConductorAgentHermes = "hermes"
+	ConductorAgentClaude   = "claude"
+	ConductorAgentCodex    = "codex"
+	ConductorAgentHermes   = "hermes"
+	ConductorAgentOpencode = "opencode"
 
 	ConductorSessionTitlePrefix     = "conductor-"
 	ConductorHeartbeatMessagePrefix = "Heartbeat:"
@@ -60,6 +61,13 @@ var conductorAgentSpecs = map[string]ConductorAgentSpec{
 		DefaultCommand:         "hermes",
 		InstructionsFileName:   "HERMES.md",
 		SupportsClearOnCompact: true,
+	},
+	ConductorAgentOpencode: {
+		Agent:                  ConductorAgentOpencode,
+		DisplayName:            "OpenCode",
+		DefaultCommand:         "opencode",
+		InstructionsFileName:   "AGENTS.md",
+		SupportsClearOnCompact: false,
 	},
 }
 
@@ -248,7 +256,7 @@ func GetConductorAgentSpec(agent string) (ConductorAgentSpec, error) {
 	normalized := normalizeConductorAgent(agent)
 	spec, ok := conductorAgentSpecs[normalized]
 	if !ok {
-		return ConductorAgentSpec{}, fmt.Errorf("unsupported conductor agent %q (supported: %s, %s, %s)", agent, ConductorAgentClaude, ConductorAgentCodex, ConductorAgentHermes)
+		return ConductorAgentSpec{}, fmt.Errorf("unsupported conductor agent %q (supported: %s, %s, %s, %s)", agent, ConductorAgentClaude, ConductorAgentCodex, ConductorAgentHermes, ConductorAgentOpencode)
 	}
 	return spec, nil
 }
@@ -719,6 +727,12 @@ func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool,
 	}
 	for otherAgent, otherSpec := range conductorAgentSpecs {
 		if otherAgent == spec.Agent {
+			continue
+		}
+		// Skip agents that share the target's instructions filename — e.g.
+		// codex and opencode both use AGENTS.md. Removing by filename here
+		// would delete the file we just wrote for the target agent.
+		if otherSpec.InstructionsFileName == spec.InstructionsFileName {
 			continue
 		}
 		stalePath := filepath.Join(dir, otherSpec.InstructionsFileName)
