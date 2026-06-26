@@ -122,6 +122,10 @@ def resolve_data_dir(*markers: str) -> Path:
 _override = os.environ.get("AGENT_DECK_CONDUCTOR_DIR", "").strip()
 CONDUCTOR_DIR = Path(os.path.expanduser(_override)) if _override else resolve_data_dir("conductor") / "conductor"
 CONFIG_PATH = resolve_config_path("config.toml")
+# Agent-deck data root (holds profiles/ and state.json). Resolved XDG-first
+# with a legacy ~/.agent-deck fallback, mirroring agentpaths.EffectiveDataDir.
+# Used by the watcher-event consumer to locate state.json + per-profile state.db.
+AGENT_DECK_DIR = resolve_data_dir("profiles", "state.json", "conductor")
 # --- end issue #1350 resolver ---
 LOG_PATH = CONDUCTOR_DIR / "bridge.log"
 
@@ -263,6 +267,22 @@ def load_config() -> dict:
         )
         sys.exit(1)
 
+    # Per-conductor channel bindings.
+    # Shape: [conductor.<name>.<platform>] channel_id = ...
+    # Harvest these from conductor_cfg children that are dicts but NOT one of
+    # the reserved platform sub-keys ("telegram"/"slack"/"discord"). Each
+    # remaining dict-valued child is treated as a conductor-name section, and
+    # any of its <platform> children contributes a binding.
+    routes = _build_routes(
+        conductor_cfg,
+        legacy_channels={
+            "slack": str(sl_channel_id) if sl_channel_id else "",
+            "discord": str(dc_channel_id) if dc_channel_id else "",
+            # Telegram routes by user_id, not channel; legacy still applies.
+            "telegram": str(tg_user_id) if tg_user_id else "",
+        },
+    )
+
     return {
         "telegram": {
             "token": tg_token,
@@ -287,7 +307,139 @@ def load_config() -> dict:
             "configured": dc_configured,
         },
         "heartbeat_interval": conductor_cfg.get("heartbeat_interval", 15),
+        "routes": routes,
     }
+
+
+# ---------------------------------------------------------------------------
+# Per-conductor channel routing
+# ---------------------------------------------------------------------------
+
+# Reserved top-level sub-keys under [conductor] — anything else that is a
+# dict is treated as a conductor-name section.
+_PLATFORM_KEYS = ("telegram", "slack", "discord")
+_RESERVED_CONDUCTOR_KEYS = set(_PLATFORM_KEYS) | {"enabled", "heartbeat_interval"}
+
+
+class Routes:
+    """Channel-id <-> conductor-name routing tables, per platform.
+
+    Built once at config load and used by both inbound (channel -> conductor)
+    and outbound (conductor -> channel) paths. Channel IDs are kept as
+    strings — Slack uses `C0XXXX...`, Discord uses int64-as-string,
+    Telegram uses chat_id-as-string — so all comparisons stringify.
+    """
+
+    def __init__(
+        self,
+        by_channel: dict,
+        by_conductor: dict,
+        legacy_channels: dict,
+    ) -> None:
+        # platform -> { channel_id_str: conductor_name }
+        self.by_channel = by_channel
+        # platform -> { conductor_name: channel_id_str }
+        self.by_conductor = by_conductor
+        # platform -> legacy fallback channel_id_str (may be "")
+        self.legacy_channels = legacy_channels
+
+    def inbound(self, platform: str, channel_id):
+        """Resolve a channel to a conductor for inbound routing.
+
+        Returns (conductor_name, is_bound):
+          * (name, True)  -> channel is bound to that conductor; the caller
+                            should ignore any `<name>:` prefix.
+          * (None, False) -> channel is not bound; caller should keep
+                            prefix-parse + default-conductor behavior.
+        """
+        key = str(channel_id)
+        target = self.by_channel.get(platform, {}).get(key)
+        if target is not None:
+            return target, True
+        return None, False
+
+    def is_known_channel(self, platform: str, channel_id) -> bool:
+        """True if channel is either bound or the legacy fallback."""
+        key = str(channel_id)
+        if key in self.by_channel.get(platform, {}):
+            return True
+        legacy = self.legacy_channels.get(platform, "")
+        return bool(legacy) and key == legacy
+
+    def outbound(self, platform: str, conductor_name: str):
+        """Resolve a conductor to a channel for outbound posting.
+
+        Returns (channel_id_str, is_bound):
+          * (channel, True)  -> per-conductor binding exists; caller should
+                               post without the `[name]` prefix (channel
+                               implies conductor).
+          * (channel, False) -> no binding; legacy fallback is in use, keep
+                               the `[name]` prefix.
+          * (None, False)    -> no binding and no legacy fallback; caller
+                               should skip (debug-log).
+        """
+        ch = self.by_conductor.get(platform, {}).get(conductor_name)
+        if ch:
+            return ch, True
+        legacy = self.legacy_channels.get(platform, "")
+        if legacy:
+            return legacy, False
+        return None, False
+
+
+def _build_routes(conductor_cfg: dict, legacy_channels: dict) -> Routes:
+    """Build the Routes table from a parsed [conductor] toml section.
+
+    Looks for [conductor.<name>.<platform>] blocks with a `channel_id` key
+    and builds the bi-directional maps. Conductor names matching reserved
+    platform keys (`telegram`/`slack`/`discord`) or other reserved keys
+    are skipped. A warning is logged for any conductor that binds to a
+    `channel_id` already claimed by another conductor on the same platform.
+    """
+    by_channel: dict = {p: {} for p in _PLATFORM_KEYS}
+    by_conductor: dict = {p: {} for p in _PLATFORM_KEYS}
+
+    for name, sub in conductor_cfg.items():
+        if name in _RESERVED_CONDUCTOR_KEYS:
+            continue
+        if not isinstance(sub, dict):
+            continue
+        for platform in _PLATFORM_KEYS:
+            block = sub.get(platform)
+            if not isinstance(block, dict):
+                continue
+            ch = block.get("channel_id")
+            if ch in (None, "", 0):
+                continue
+            ch_str = str(ch)
+            existing = by_channel[platform].get(ch_str)
+            if existing and existing != name:
+                log.warning(
+                    "Routing conflict on %s channel %s: bound to both %r "
+                    "and %r — keeping %r",
+                    platform, ch_str, existing, name, existing,
+                )
+                continue
+            by_channel[platform][ch_str] = name
+            by_conductor[platform][name] = ch_str
+
+    # Sanity check legacy channel doesn't collide with a bound channel — if it
+    # does, the bound binding wins (inbound resolution checks by_channel first),
+    # and we warn so the user can clean it up.
+    for platform, legacy in legacy_channels.items():
+        if legacy and legacy in by_channel.get(platform, {}):
+            log.warning(
+                "Legacy [conductor.%s].channel_id %s also appears as a "
+                "per-conductor binding (%s). The binding wins; consider "
+                "removing the legacy channel_id.",
+                platform, legacy, by_channel[platform][legacy],
+            )
+
+    return Routes(
+        by_channel=by_channel,
+        by_conductor=by_conductor,
+        legacy_channels=dict(legacy_channels),
+    )
 
 
 def discover_conductors() -> list[dict]:
@@ -1214,6 +1366,61 @@ def md_to_tg_html(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+BRIDGE_ATTACHMENTS_DIR = AGENT_DECK_DIR / "bridge-attachments"
+
+
+async def _save_discord_attachments(message) -> list:
+    """Download every attachment on a Discord message to local disk.
+
+    Layout: <data-root>/bridge-attachments/<channel_id>/<msg_id>/<filename>
+
+    Returns the list of absolute file paths that were successfully downloaded.
+    Failures are logged but never raised — a partial download is better than
+    dropping the whole message.
+    """
+    if not getattr(message, "attachments", None):
+        return []
+    channel_id = str(message.channel.id)
+    msg_id = str(message.id)
+    target_dir = BRIDGE_ATTACHMENTS_DIR / channel_id / msg_id
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.error(
+            "Failed to create attachment dir %s: %s", target_dir, e,
+        )
+        return []
+
+    saved: list = []
+    for att in message.attachments:
+        filename = getattr(att, "filename", "") or f"attachment-{att.id}"
+        # Defense-in-depth: strip any path-traversal that might come through
+        # despite Discord's own sanitization.
+        filename = os.path.basename(filename) or f"attachment-{att.id}"
+        dest = target_dir / filename
+        try:
+            await att.save(str(dest))
+            saved.append(str(dest))
+            log.info("Saved Discord attachment %s", dest)
+        except Exception as e:
+            log.error(
+                "Failed to save attachment %s: %s", filename, e,
+            )
+    return saved
+
+
+def _augment_text_with_attachments(text: str, attached_paths: list) -> str:
+    """Append `[ATTACHED:/path]` markers to the message text so the conductor
+    sees the local paths of any uploaded files. Returns the original text
+    unchanged when there are no attachments."""
+    if not attached_paths:
+        return text
+    suffix = " ".join(f"[ATTACHED:{p}]" for p in attached_paths)
+    if text.strip():
+        return f"{text} {suffix}"
+    return suffix
+
+
 def parse_discord_message_parts(text: str) -> list[tuple[str, str]]:
     """Split Discord output into plain-text and image-upload segments."""
     parts = []
@@ -1852,8 +2059,15 @@ def create_slack_app(config: dict):
         """Shared handler for Slack messages and mentions."""
         conductor_names = get_conductor_names()
         conductors = discover_conductors()
+        routes: Routes = config["routes"]
 
-        target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
+        # Per-channel binding wins over name-prefix parsing.
+        bound_target, is_bound = routes.inbound("slack", event_channel or "")
+        if is_bound:
+            target_name = bound_target
+            cleaned_msg = text
+        else:
+            target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
 
         target = None
         if target_name:
@@ -1861,7 +2075,7 @@ def create_slack_app(config: dict):
                 if c["name"] == target_name:
                     target = c
                     break
-        if target is None:
+        if target is None and not is_bound:
             target = get_default_conductor()
         if target is None:
             await _safe_say(
@@ -1912,7 +2126,10 @@ def create_slack_app(config: dict):
 
         log.info("Slack message -> [%s]: %s", target["name"], cleaned_msg[:100])
 
-        name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
+        name_tag = (
+            "" if is_bound else
+            (f"[{target['name']}] " if len(conductors) > 1 else "")
+        )
 
         if was_busy:
             name_tag_captured = name_tag
@@ -2011,8 +2228,12 @@ def create_slack_app(config: dict):
         # Ignore bot messages
         if event.get("bot_id") or event.get("subtype"):
             return
-        # Only listen in configured channel
-        if event.get("channel") != channel_id:
+        # Only listen on known channels (legacy + per-conductor bindings).
+        evt_channel = event.get("channel", "")
+        slack_known = set(config["routes"].by_channel.get("slack", {}).keys())
+        if channel_id:
+            slack_known.add(str(channel_id))
+        if str(evt_channel) not in slack_known:
             return
 
         # Authorization check
@@ -2197,6 +2418,14 @@ def create_discord_bot(config: dict):
     guild_id = config["discord"]["guild_id"]
     channel_id = config["discord"]["channel_id"]
     authorized_user = config["discord"]["user_id"]
+    routes: Routes = config["routes"]
+    # Channels the bot should listen on at all = legacy channel + every bound
+    # channel for the discord platform.
+    bound_channels = {
+        int(ch) for ch in routes.by_channel.get("discord", {}).keys()
+    }
+    if channel_id:
+        bound_channels.add(int(channel_id))
     listen_mode = str(config["discord"].get("listen_mode", "all") or "all").strip().lower()
     ignore_replies_to_others = bool(
         config["discord"].get("ignore_replies_to_others", False)
@@ -2274,10 +2503,11 @@ def create_discord_bot(config: dict):
         return False
 
     async def ensure_discord_channel(interaction: discord.Interaction) -> bool:
-        """Restrict slash commands to the configured channel."""
-        if interaction.channel_id != channel_id:
+        """Restrict slash commands to a known channel (legacy or any
+        per-conductor binding)."""
+        if interaction.channel_id not in bound_channels:
             await interaction.response.send_message(
-                "This command is only available in the configured channel.",
+                "This command is only available in a configured channel.",
                 ephemeral=True,
             )
             return False
@@ -2454,8 +2684,8 @@ def create_discord_bot(config: dict):
         # Ignore messages from other bots
         if message.author.bot:
             return
-        # Only listen in the configured channel
-        if message.channel.id != bot.target_channel_id:
+        # Only listen on known channels (legacy + per-conductor bindings).
+        if message.channel.id not in bound_channels:
             return
         # Authorization check
         if not is_authorized(message.author.id):
@@ -2471,16 +2701,34 @@ def create_discord_bot(config: dict):
             if not message_mentions_bot(message):
                 return
             text = strip_bot_mentions(text)
-        # Ignore empty messages
+
+        # Download attachments (if any) to a local path the conductor can read,
+        # then suffix the text with `[ATTACHED:/path]` markers. This lets
+        # attachment-only messages still route through (the old code
+        # short-circuited on empty text and dropped image-only posts).
+        attached_paths = []
+        if getattr(message, "attachments", None):
+            attached_paths = await _save_discord_attachments(message)
+        text = _augment_text_with_attachments(text, attached_paths)
+
+        # Ignore truly-empty messages (no text and no attachments).
         if not text:
             return
 
         conductor_names = get_conductor_names()
         conductors = discover_conductors()
 
-        target_name, cleaned_msg = parse_conductor_prefix(
-            text, conductor_names,
-        )
+        # Resolve target: if this channel is bound to a specific conductor,
+        # that wins and we ignore any `<name>:` prefix. Only on the legacy
+        # fallback channel do we fall through to prefix-parse + default.
+        bound_target, is_bound = routes.inbound("discord", message.channel.id)
+        if is_bound:
+            target_name = bound_target
+            cleaned_msg = text
+        else:
+            target_name, cleaned_msg = parse_conductor_prefix(
+                text, conductor_names,
+            )
 
         target = None
         if target_name:
@@ -2488,7 +2736,7 @@ def create_discord_bot(config: dict):
                 if c["name"] == target_name:
                     target = c
                     break
-        if target is None:
+        if target is None and not is_bound:
             target = get_default_conductor()
         if target is None:
             await message.channel.send(
@@ -2532,7 +2780,8 @@ def create_discord_bot(config: dict):
                 # Mirrors the Telegram/Slack idle paths (#1404).
                 dc_channel = message.channel
                 dc_name_tag = (
-                    f"[{target['name']}] " if len(conductors) > 1 else ""
+                    "" if is_bound else
+                    (f"[{target['name']}] " if len(conductors) > 1 else "")
                 )
 
                 async def _dc_late_reply(response_text: str):
@@ -2556,7 +2805,8 @@ def create_discord_bot(config: dict):
         )
 
         name_tag = (
-            f"[{target['name']}] " if len(conductors) > 1 else ""
+            "" if is_bound else
+            (f"[{target['name']}] " if len(conductors) > 1 else "")
         )
         await send_discord_output(message.channel, response, name_tag=name_tag)
 
@@ -2591,6 +2841,53 @@ def _os_heartbeat_daemon_installed() -> bool:
                 if f.startswith("agent-deck-conductor-heartbeat-") and f.endswith(".timer"):
                     return True
     return False
+
+
+def _format_alert_body(
+    conductor_name: str, response: str, *, is_bound: bool, multi: bool,
+) -> str:
+    """Build the alert body. Bound channels (or single-conductor setups) drop
+    the `[name]` prefix because the channel already identifies the conductor;
+    legacy fallback channels in multi-conductor setups keep it so the user can
+    tell which conductor is speaking."""
+    if is_bound or not multi:
+        return f"Conductor alert:\n{response}"
+    return f"[{conductor_name}] Conductor alert:\n{response}"
+
+
+async def _post_discord_alert(
+    discord_bot, routes: "Routes", conductor_name: str,
+    response: str, multi: bool,
+) -> None:
+    """Proactive Discord post for a conductor NEED-alert.
+
+    Resolution:
+      * Bound channel for the conductor → post there, no [name] prefix.
+      * No binding but a legacy fallback channel configured → post there with
+        [name] prefix when multi-conductor.
+      * No binding and no legacy → skip (debug log).
+    """
+    target_ch, is_bound = routes.outbound("discord", conductor_name)
+    if target_ch is None:
+        log.debug(
+            "Skipping Discord alert for %s: no binding and no legacy channel.",
+            conductor_name,
+        )
+        return
+    body = _format_alert_body(
+        conductor_name, response, is_bound=is_bound, multi=multi,
+    )
+    try:
+        channel = discord_bot.get_channel(int(target_ch))
+        if channel is None:
+            log.warning(
+                "Discord channel %s for conductor %s not found by client "
+                "(not joined?)", target_ch, conductor_name,
+            )
+            return
+        await send_discord_output(channel, body)
+    except Exception as e:
+        log.error("Failed to send Discord notification: %s", e)
 
 
 async def heartbeat_loop(
@@ -2790,16 +3087,24 @@ async def heartbeat_loop(
                         need_filtered["retired"],
                     )
                 if has_alerts:
-                    prefix = (
-                        f"[{name}] " if len(all_conductors) > 1 else ""
-                    )
+                    # Per-conductor channel bindings take precedence over the
+                    # legacy single-channel fallback; bound channels drop the
+                    # [name] prefix since the channel itself already implies
+                    # which conductor is speaking.
+                    routes: Routes = config["routes"]
+                    multi = len(all_conductors) > 1
                     alert_body = "\n".join(forwarded_need_lines)
-                    alert_msg = f"{prefix}Conductor alert:\n{alert_body}"
 
-                    # Notify via Telegram (with HTML formatting)
+                    # Notify via Telegram (with HTML formatting) — one user,
+                    # one chat. No real channels; legacy behavior preserved.
                     if telegram_bot and tg_user_id:
                         try:
-                            alert_html = md_to_tg_html(alert_msg)
+                            alert_html = md_to_tg_html(
+                                _format_alert_body(
+                                    name, alert_body,
+                                    is_bound=False, multi=multi,
+                                )
+                            )
                             for chunk in split_message(alert_html):
                                 await telegram_bot.send_message(
                                     tg_user_id,
@@ -2811,27 +3116,34 @@ async def heartbeat_loop(
                                 "Failed to send Telegram notification: %s", e
                             )
 
-                    # Notify via Slack
-                    if slack_app and slack_channel_id:
-                        try:
-                            await slack_app.client.chat_postMessage(
-                                channel=slack_channel_id, text=alert_msg,
-                            )
-                        except Exception as e:
-                            log.error(
-                                "Failed to send Slack notification: %s", e
+                    # Notify via Slack — per-conductor or legacy fallback.
+                    if slack_app:
+                        target_ch, is_bound = routes.outbound("slack", name)
+                        if target_ch:
+                            try:
+                                await slack_app.client.chat_postMessage(
+                                    channel=target_ch,
+                                    text=_format_alert_body(
+                                        name, alert_body,
+                                        is_bound=is_bound, multi=multi,
+                                    ),
+                                )
+                            except Exception as e:
+                                log.error(
+                                    "Failed to send Slack notification: %s", e
+                                )
+                        else:
+                            log.debug(
+                                "Skipping Slack alert for %s: no binding and "
+                                "no legacy channel.", name,
                             )
 
-                    # Notify via Discord
-                    if discord_bot and discord_channel_id:
-                        try:
-                            channel = discord_bot.get_channel(discord_channel_id)
-                            if channel:
-                                await send_discord_output(channel, alert_msg)
-                        except Exception as e:
-                            log.error(
-                                "Failed to send Discord notification: %s", e
-                            )
+                    # Notify via Discord — per-conductor or legacy fallback.
+                    if discord_bot:
+                        await _post_discord_alert(
+                            discord_bot, routes, name,
+                            response=alert_body, multi=multi,
+                        )
 
                 # Run post-heartbeat hook (non-gating)
                 invoke_hook(profile, "post-heartbeat", {
@@ -2842,6 +3154,493 @@ async def heartbeat_loop(
 
             except Exception as e:
                 log.error("Heartbeat [%s] error: %s", conductor.get("name", "?"), e)
+
+
+# ---------------------------------------------------------------------------
+# Watcher event consumer (gh-watcher routed events → per-session delivery)
+# ---------------------------------------------------------------------------
+
+DEFAULT_WATCHER_POLL_SECONDS = 10
+DEFAULT_WATCHER_RATE_LIMIT_PER_MINUTE = 6
+DEFAULT_PR_LABELED_COALESCE_WINDOW = 10  # seconds
+DEFAULT_WATCHER_FALLBACK_CONDUCTOR = "core"
+DEFAULT_WATCHER_DB_PROFILE = "default"
+
+_PR_NUM_RE = re.compile(r"#(\d+)")
+_COR_RE = re.compile(r"\b[Cc][Oo][Rr][-_](\d+)\b")
+_BRANCH_SLUG_RE = re.compile(
+    r"(?:feature|fix|test|chore|feat|hotfix|refactor)/[a-z0-9._/-]+",
+    re.IGNORECASE,
+)
+_PR_LABELED_RE = re.compile(r"\[PR labeled\]")
+_ORCA_BOT_SENDER = "orca-security-au[bot]@github.com"
+_PR_REVIEW_RE = re.compile(r"\[pull_request_review\]")
+# Verdict tokens GitHub uses in review payloads. Subjects that include any of
+# these carry actionable signal and must NOT be dropped by the bare-review
+# filter.
+_PR_REVIEW_VERDICT_RE = re.compile(
+    r"\b(approved|changes_requested|commented|dismissed)\b",
+    re.IGNORECASE,
+)
+_PR_EDITED_RE = re.compile(r"\[PR edited\]")
+
+
+def extract_match_keys(subject: str) -> dict:
+    """Pull routing hints out of a watcher event subject line.
+
+    Returns a dict with optional 'pr', 'cor', 'branch' keys. Each is a string
+    (the numeric ID or the slug) so consumers can compose loose substring
+    matches against session paths/titles.
+    """
+    out: dict = {}
+    m = _PR_NUM_RE.search(subject)
+    if m:
+        out["pr"] = m.group(1)
+    m = _COR_RE.search(subject)
+    if m:
+        out["cor"] = m.group(1)
+    m = _BRANCH_SLUG_RE.search(subject)
+    if m:
+        out["branch"] = m.group(0)
+    return out
+
+
+def find_target_session(keys: dict, sessions: list) -> dict | None:
+    """Pick the active session most likely to be working on the event.
+
+    Match priority:
+      1. PR number → session.title == "<num>" OR session.path matches
+         feature-<num> / pr-<num>
+      2. COR ticket → session.path or title contains cor-<num>
+      3. Branch slug → session.path contains the slug
+
+    On ties (multiple matches at the same priority), the session with the
+    longest substring overlap against the matched key wins — deterministic
+    tiebreaker that picks the most-specific working tree.
+
+    Returns None if nothing matches.
+    """
+    def _candidates_at(priority: int) -> list:
+        result: list = []
+        if priority == 1 and "pr" in keys:
+            pr = keys["pr"]
+            for s in sessions:
+                t = s.get("title", "") or ""
+                p = (s.get("path", "") or "").lower()
+                score = 0
+                if t == pr:
+                    score = max(score, len(pr) + 1000)
+                if f"feature-{pr}" in p or f"pr-{pr}" in p:
+                    score = max(score, len(pr) + 500)
+                if score:
+                    result.append((score, s))
+        elif priority == 2 and "cor" in keys:
+            cor = keys["cor"]
+            needle = f"cor-{cor}"
+            for s in sessions:
+                t = (s.get("title", "") or "").lower()
+                p = (s.get("path", "") or "").lower()
+                if needle in p:
+                    result.append((len(p), s))
+                elif needle in t:
+                    result.append((len(t), s))
+        elif priority == 3 and "branch" in keys:
+            slug = keys["branch"].lower()
+            for s in sessions:
+                p = (s.get("path", "") or "").lower()
+                if slug in p:
+                    result.append((len(slug), s))
+        return result
+
+    for prio in (1, 2, 3):
+        cands = _candidates_at(prio)
+        if cands:
+            cands.sort(key=lambda x: -x[0])
+            return cands[0][1]
+    return None
+
+
+def load_watcher_consumer_config() -> dict:
+    """Read watcher-consumer tunables from <data-root>/state.json.
+
+    Shape (all optional):
+      { "watcher_consumer": {
+          "poll_interval_seconds": 10,
+          "rate_limit_per_minute": 6,
+          "coalesce_pr_labeled_window_s": 10,
+          "fallback_conductor": "core",
+          "db_profile": "default",
+          "watcher_id": "<uuid-of-watcher-to-consume>",
+          "drop_bare_pr_review": true,
+          "drop_bare_pr_edit": true
+      } }
+    """
+    out = {
+        "poll_interval_seconds": DEFAULT_WATCHER_POLL_SECONDS,
+        "rate_limit_per_minute": DEFAULT_WATCHER_RATE_LIMIT_PER_MINUTE,
+        "coalesce_pr_labeled_window_s": DEFAULT_PR_LABELED_COALESCE_WINDOW,
+        "fallback_conductor": DEFAULT_WATCHER_FALLBACK_CONDUCTOR,
+        "db_profile": DEFAULT_WATCHER_DB_PROFILE,
+        "watcher_id": "",
+        "drop_bare_pr_review": True,
+        "drop_bare_pr_edit": True,
+    }
+    state_path = AGENT_DECK_DIR / "state.json"
+    if not state_path.exists():
+        return out
+    try:
+        data = json.loads(state_path.read_text())
+    except (json.JSONDecodeError, IOError) as e:
+        log.warning("state.json unreadable for watcher_consumer: %s", e)
+        return out
+    wc = data.get("watcher_consumer", {}) or {}
+    if not isinstance(wc, dict):
+        return out
+    for key in (
+        "poll_interval_seconds",
+        "rate_limit_per_minute",
+        "coalesce_pr_labeled_window_s",
+    ):
+        v = wc.get(key)
+        # 0 is a valid value for the poll interval (no delay between polls,
+        # used in tests). Negative values are rejected.
+        if isinstance(v, (int, float)) and v >= 0:
+            out[key] = int(v)
+    for key in ("fallback_conductor", "db_profile", "watcher_id"):
+        v = wc.get(key)
+        if isinstance(v, str) and v:
+            out[key] = v
+    # Boolean toggles (explicit, so users can flip them off without deleting
+    # the key).
+    if "drop_bare_pr_review" in wc:
+        v = wc.get("drop_bare_pr_review")
+        if isinstance(v, bool):
+            out["drop_bare_pr_review"] = v
+    if "drop_bare_pr_edit" in wc:
+        v = wc.get("drop_bare_pr_edit")
+        if isinstance(v, bool):
+            out["drop_bare_pr_edit"] = v
+    return out
+
+
+class WatcherConsumerState:
+    """In-memory state for the watcher event consumer.
+
+    * `last_seen_id`: SQLite cursor. Initialized to max(id) at startup so we
+      don't re-deliver historical events. Resets on bridge restart (in-memory
+      only by design).
+    * `pr_labeled_seen`: per-PR last-seen-ts for the labeled-event coalesce
+      window.
+    * `rate_window`: per-conductor sliding 60s deque of delivery timestamps
+      for rate-limiting.
+    """
+
+    def __init__(self) -> None:
+        self.last_seen_id: int = 0
+        self.pr_labeled_seen: dict = {}
+        from collections import deque
+        self._deque = deque
+        self.rate_window: dict = {}
+
+    def can_deliver(
+        self, conductor_name: str, now: float, rate_limit_per_minute: int,
+    ) -> bool:
+        """True iff a delivery to `conductor_name` would stay under the rate
+        cap. Slides the window as a side-effect."""
+        dq = self.rate_window.setdefault(conductor_name, self._deque())
+        cutoff = now - 60.0
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= rate_limit_per_minute:
+            return False
+        return True
+
+    def record_delivery(self, conductor_name: str, now: float) -> None:
+        self.rate_window.setdefault(conductor_name, self._deque()).append(now)
+
+
+def should_drop_orca_review(sender: str, subject: str) -> bool:
+    """v1 policy: drop every pull_request_review from orca-security-au.
+
+    Subject doesn't currently carry the review state, and the brief explicitly
+    accepted the lossy filter for v1.
+    """
+    if sender != _ORCA_BOT_SENDER:
+        return False
+    return "[pull_request_review]" in subject
+
+
+def should_drop_bare_pr_review(subject: str) -> bool:
+    """Drop `[pull_request_review]` events that carry no PR# and no verdict
+    (approved / changes_requested / commented / dismissed).
+
+    Rationale: the github watcher emits one of these for every review action —
+    comment, approve, individual inline reply — but the current subject format
+    strips both the PR number and the review state. They land as
+    `[pull_request_review] event from <repo>`, which the conductor can't act on
+    (no PR to look up, no signal of whether the verdict needs a response). Net
+    noise.
+
+    Sender-agnostic by design — applies to all reviewers, not just the existing
+    orca-bot carveout. Config-driven via
+    `state.json#watcher_consumer.drop_bare_pr_review` (default on).
+
+    Future-proof: a `[pull_request_review]` subject that includes a PR# (e.g.
+    `#1832`) OR an explicit verdict keyword is preserved — the conductor can act
+    on those.
+    """
+    if not _PR_REVIEW_RE.search(subject):
+        return False
+    if _PR_NUM_RE.search(subject):
+        return False  # has PR# — actionable, keep
+    if _PR_REVIEW_VERDICT_RE.search(subject):
+        return False  # has verdict — actionable, keep
+    return True
+
+
+def should_drop_bare_pr_edit(subject: str) -> bool:
+    """Drop `[PR edited]` events. The github watcher emits one of these for
+    every title/description change — including the Linear sync-bot, which can
+    flood a single PR with 9+ identical events in minutes. Edits carry no
+    commit and no state change, so the conductor cannot act on them.
+
+    Sender-agnostic by design — applies to all editors (human, bot, Linear
+    sync). Config-driven via `state.json#watcher_consumer.drop_bare_pr_edit`
+    (default on).
+
+    Naming consistency with `should_drop_bare_pr_review`: 'bare' here means 'no
+    actionable signal', not 'no PR number'. PR-edited events DO carry a PR# —
+    they're still noise.
+    """
+    return bool(_PR_EDITED_RE.search(subject))
+
+
+def should_coalesce_pr_labeled(
+    subject: str,
+    state: WatcherConsumerState,
+    now: float,
+    window_s: int,
+) -> bool:
+    """True if this is a `[PR labeled]` event for a PR we already saw a
+    `[PR labeled]` for within the coalesce window. Side-effect: records `now`
+    as the new last-seen for that PR."""
+    if not _PR_LABELED_RE.search(subject):
+        return False
+    m = _PR_NUM_RE.search(subject)
+    if not m:
+        return False
+    pr = m.group(1)
+    prior = state.pr_labeled_seen.get(pr)
+    state.pr_labeled_seen[pr] = now
+    if prior is None:
+        return False
+    return (now - prior) < window_s
+
+
+async def consume_watcher_events_loop(
+    config: dict, watcher_state: WatcherConsumerState,
+) -> None:
+    """Poll watcher_events in profile state.db, route fresh rows to the active
+    session working on the matching PR/COR/branch, or fall back to the
+    configured fallback conductor."""
+    cfg = load_watcher_consumer_config()
+    interval = cfg["poll_interval_seconds"]
+    rate_limit = cfg["rate_limit_per_minute"]
+    coalesce_window = cfg["coalesce_pr_labeled_window_s"]
+    fallback = cfg["fallback_conductor"]
+    drop_bare_pr_review = cfg["drop_bare_pr_review"]
+    drop_bare_pr_edit = cfg["drop_bare_pr_edit"]
+    db_path = AGENT_DECK_DIR / "profiles" / cfg["db_profile"] / "state.db"
+    watcher_id_filter = cfg["watcher_id"]
+
+    if not db_path.exists():
+        log.warning(
+            "Watcher consumer: state.db not found at %s, not starting",
+            db_path,
+        )
+        return
+
+    loop = asyncio.get_running_loop()
+    watcher_state.last_seen_id = await loop.run_in_executor(
+        None,
+        functools.partial(_init_watcher_cursor, db_path, watcher_id_filter),
+    )
+    log.info(
+        "Watcher consumer started (poll=%ds, db=%s, cursor=%d, fallback=%s)",
+        interval, db_path, watcher_state.last_seen_id, fallback,
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            events = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    _fetch_new_events, db_path, watcher_state.last_seen_id,
+                    watcher_id_filter,
+                ),
+            )
+            if not events:
+                continue
+            sessions = await loop.run_in_executor(
+                None, _list_all_sessions,
+            )
+            for ev in events:
+                watcher_state.last_seen_id = max(
+                    watcher_state.last_seen_id, ev["id"],
+                )
+                await _deliver_watcher_event(
+                    ev, sessions, watcher_state, rate_limit,
+                    coalesce_window, fallback,
+                    drop_bare_pr_review=drop_bare_pr_review,
+                    drop_bare_pr_edit=drop_bare_pr_edit,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("Watcher consumer error: %s", e)
+
+
+def _init_watcher_cursor(db_path: Path, watcher_id_filter: str) -> int:
+    """Read max(id) from watcher_events at startup so the loop resumes past
+    history. Returns 0 if the table is empty or unreadable."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            cur = con.cursor()
+            q = "SELECT COALESCE(MAX(id), 0) FROM watcher_events"
+            args: tuple = ()
+            if watcher_id_filter:
+                q += " WHERE watcher_id = ?"
+                args = (watcher_id_filter,)
+            return cur.execute(q, args).fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        log.warning("Watcher consumer: init cursor failed: %s", e)
+        return 0
+
+
+def _fetch_new_events(
+    db_path: Path, since_id: int, watcher_id_filter: str,
+) -> list:
+    """Read rows with id > since_id from watcher_events (read-only)."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            cur = con.cursor()
+            q = (
+                "SELECT id, watcher_id, sender, subject, routed_to, "
+                "created_at FROM watcher_events WHERE id > ?"
+            )
+            args: tuple = (since_id,)
+            if watcher_id_filter:
+                q += " AND watcher_id = ?"
+                args = (since_id, watcher_id_filter)
+            q += " ORDER BY id ASC"
+            rows = cur.execute(q, args).fetchall()
+            return [
+                {
+                    "id": r[0], "watcher_id": r[1], "sender": r[2],
+                    "subject": r[3], "routed_to": r[4], "created_at": r[5],
+                }
+                for r in rows
+            ]
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        log.warning("Watcher consumer: fetch failed: %s", e)
+        return []
+
+
+def _list_all_sessions() -> list:
+    """Wrapper around `agent-deck list -all -json`. Empty list on error."""
+    result = run_cli("list", "-all", "-json", timeout=30)
+    if result.returncode != 0:
+        return []
+    try:
+        data = json.loads(result.stdout)
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
+async def _deliver_watcher_event(
+    ev: dict,
+    sessions: list,
+    state: WatcherConsumerState,
+    rate_limit: int,
+    coalesce_window: int,
+    fallback: str,
+    drop_bare_pr_review: bool = True,
+    drop_bare_pr_edit: bool = True,
+) -> None:
+    """Filter, route, and deliver a single watcher event."""
+    subject = ev["subject"]
+    sender = ev["sender"]
+    now = time.time()
+
+    if should_drop_orca_review(sender, subject):
+        log.debug("Watcher consumer: dropping orca review %s", subject[:60])
+        return
+    if drop_bare_pr_review and should_drop_bare_pr_review(subject):
+        log.debug(
+            "Watcher consumer: dropping bare pull_request_review from %s: %s",
+            sender, subject[:80],
+        )
+        return
+    if drop_bare_pr_edit and should_drop_bare_pr_edit(subject):
+        log.debug(
+            "Watcher consumer: dropping bare PR-edit from %s: %s",
+            sender, subject[:80],
+        )
+        return
+    if should_coalesce_pr_labeled(subject, state, now, coalesce_window):
+        log.debug(
+            "Watcher consumer: coalescing labeled event %s", subject[:60],
+        )
+        return
+
+    keys = extract_match_keys(subject)
+    target = find_target_session(keys, sessions)
+    if target is None:
+        # Route to fallback conductor.
+        target_name = fallback
+        session_title = conductor_session_title(fallback)
+        profile = "default"
+        log.info(
+            "Watcher consumer: no session match for %s → fallback %s",
+            subject[:80], fallback,
+        )
+    else:
+        target_name = target.get("title", "?")
+        session_title = target_name
+        profile = target.get("profile") or "default"
+        log.info(
+            "Watcher consumer: matched %s → session %s",
+            subject[:80], target_name,
+        )
+
+    if not state.can_deliver(target_name, now, rate_limit):
+        log.warning(
+            "Watcher consumer: rate-limited delivery to %s, dropping %s",
+            target_name, subject[:80],
+        )
+        return
+
+    msg = f"[WATCHER] {subject}\n(from: {sender})"
+    loop = asyncio.get_running_loop()
+    ok, _, _ = await loop.run_in_executor(
+        None,
+        functools.partial(
+            send_to_conductor, session_title, msg,
+            profile=profile, wait_for_reply=False,
+        ),
+    )
+    if ok:
+        state.record_delivery(target_name, now)
 
 
 # ---------------------------------------------------------------------------
@@ -2929,8 +3728,17 @@ async def main():
         )
     )
 
+    # Start the gh-watcher event consumer (routes watcher_events rows to
+    # whichever session is working on the matching PR/COR/branch, falling back
+    # to the configured fallback conductor). Self-disables if state.db is
+    # absent.
+    watcher_consumer_state = WatcherConsumerState()
+    watcher_consumer_task = asyncio.create_task(
+        consume_watcher_events_loop(config, watcher_consumer_state)
+    )
+
     # Run all concurrently
-    tasks = [heartbeat_task]
+    tasks = [heartbeat_task, watcher_consumer_task]
     if telegram_dp and telegram_bot:
         tasks.append(asyncio.create_task(telegram_dp.start_polling(telegram_bot)))
         log.info("Telegram bot polling started")
@@ -2945,6 +3753,7 @@ async def main():
         await asyncio.gather(*tasks)
     finally:
         heartbeat_task.cancel()
+        watcher_consumer_task.cancel()
         if telegram_bot:
             await telegram_bot.session.close()
         if slack_handler:

@@ -2217,8 +2217,8 @@ func TestBridgeTemplate_DiscordSlashCommandsChannelRestriction(t *testing.T) {
 	template := conductorBridgePy
 	patterns := []string{
 		"async def ensure_discord_channel(interaction: discord.Interaction) -> bool:",
-		`if interaction.channel_id != channel_id:`,
-		`"This command is only available in the configured channel."`,
+		`if interaction.channel_id not in bound_channels:`,
+		`"This command is only available in a configured channel."`,
 		"if not await ensure_discord_channel(interaction):",
 	}
 	for _, pattern := range patterns {
@@ -2270,8 +2270,14 @@ func TestBridgeTemplate_DiscordHeartbeatNotification(t *testing.T) {
 	if !strings.Contains(template, "Failed to send Discord notification") {
 		t.Error("heartbeat should handle Discord notification errors")
 	}
-	if !strings.Contains(template, "await send_discord_output(channel, alert_msg)") {
-		t.Error("heartbeat should route Discord notifications through send_discord_output")
+	// Discord heartbeat alerts are routed through the per-conductor-aware
+	// _post_discord_alert helper, which resolves the bound (or legacy) channel
+	// and posts via send_discord_output.
+	if !strings.Contains(template, "await _post_discord_alert(") {
+		t.Error("heartbeat should route Discord notifications through _post_discord_alert")
+	}
+	if !strings.Contains(template, "await send_discord_output(channel, body)") {
+		t.Error("_post_discord_alert should post via send_discord_output")
 	}
 }
 
