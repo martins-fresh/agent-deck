@@ -27,6 +27,15 @@ import (
 func (i *Instance) buildEnvSourceCommand() string {
 	var sources []string
 
+	// 0. Session identity. Exported first (and unconditionally) so any
+	// `agent-deck session send` invoked from within this session is
+	// automatically attributed to it — message provenance. The receiving
+	// send command reads $AGENT_DECK_SESSION to distinguish internal
+	// peer-conductor/peer-session traffic from user/channel messages.
+	if idEnv := i.sessionIdentityEnv(); idEnv != "" {
+		sources = append(sources, idEnv)
+	}
+
 	// 1. Theme environment (COLORFGBG) so tools like Codex detect light/dark theme.
 	// Set early so env files or init scripts can override if needed.
 	// For sandboxed sessions, COLORFGBG is injected via docker exec environment
@@ -565,6 +574,26 @@ func (i *Instance) getToolEnvFile() string {
 		}
 	}
 	return ""
+}
+
+// sessionIdentityEnv exports this session's own identity so that any
+// `agent-deck session send` invoked from within the session (e.g. a conductor
+// messaging a peer) is automatically attributed to it. The send command reads
+// $AGENT_DECK_SESSION to classify message provenance.
+//
+// Observability-grade, not a security boundary: a process inside the session
+// could override these vars, but today nothing is attributed at all, so this is
+// a large step up. Authoritative attribution for user/channel messages comes
+// from the bridge's explicit `--from` flag instead.
+func (i *Instance) sessionIdentityEnv() string {
+	if i.Title == "" {
+		return ""
+	}
+	quote := func(s string) string { return strings.ReplaceAll(s, "'", "'\\''") }
+	return fmt.Sprintf(
+		"export AGENT_DECK_SESSION='%s' && export AGENT_DECK_SESSION_ID='%s'",
+		quote(i.Title), quote(i.ID),
+	)
 }
 
 // getConductorEnv returns shell export commands for conductor-specific env vars.

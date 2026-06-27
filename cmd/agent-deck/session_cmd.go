@@ -2090,6 +2090,7 @@ func handleSessionSend(profile string, args []string) {
 	wait := fs.Bool("wait", false, "Block until agent finishes processing, then print output")
 	stream := fs.Bool("stream", false, "Stream JSONL events (Claude only) to stdout instead of returning a snapshot")
 	draft := fs.Bool("draft", false, "Pre-fill the prompt without submitting (incompatible with --wait/--stream/--no-wait)")
+	from := fs.String("from", "", "Message source for provenance (e.g. user:discord, bridge:watcher). Defaults to $AGENT_DECK_SESSION so peer-session sends self-attribute.")
 	timeout := fs.Duration("timeout", 10*time.Minute, "Max time to wait for the agent to become ready and (with --wait) to finish processing")
 	streamIdle := fs.Duration("stream-idle", 10*time.Second, "Max idle time before --stream aborts with error")
 	streamCharBudget := fs.Int("stream-char-budget", 4000, "Char budget for text flush in --stream mode")
@@ -2179,6 +2180,41 @@ func handleSessionSend(profile string, args []string) {
 			"message":       message,
 		})
 		return
+	}
+
+	// Message provenance. Resolve the source: an explicit --from wins (the
+	// bridge sets it authoritatively for user/channel/system traffic);
+	// otherwise fall back to $AGENT_DECK_SESSION, which is exported into every
+	// session's shell so a peer conductor/worker self-attributes. Empty means
+	// a manual terminal/script send (logged as "unattributed").
+	//
+	// Done AFTER the heartbeat-skip check above so heartbeat detection sees the
+	// original text, and BEFORE delivery so the in-pane tag is part of what the
+	// recipient receives. Logging is best-effort and never blocks the send.
+	msgSource := *from
+	if msgSource == "" {
+		msgSource = os.Getenv("AGENT_DECK_SESSION")
+	}
+	msgClass := session.ClassifyMessageSource(msgSource)
+	deliveryMode := "ready-wait"
+	if *noWait {
+		deliveryMode = "no-wait"
+	} else if *wait {
+		deliveryMode = "wait"
+	} else if *draft {
+		deliveryMode = "draft"
+	}
+	session.LogMessageProvenance(session.MsgProvenanceRecord{
+		TS:       time.Now().UTC().Format(time.RFC3339),
+		Target:   inst.Title,
+		TargetID: inst.ID,
+		Source:   msgSource,
+		Class:    msgClass,
+		Mode:     deliveryMode,
+		Preview:  session.MessagePreview(message, 200),
+	})
+	if tag := session.MessageProvenanceTag(msgSource, msgClass); tag != "" {
+		message = tag + message
 	}
 
 	// Get tmux session

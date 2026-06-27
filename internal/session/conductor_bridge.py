@@ -601,6 +601,12 @@ def _is_still_running_timeout(stderr: str) -> bool:
     return "timeout waiting for completion" in s or "still running" in s
 
 
+def _from_args(source: str | None) -> list:
+    """CLI args carrying message provenance to `session send`, or [] when no
+    source is set. The Go side classifies/logs it and tags the pane."""
+    return ["--from", source] if source else []
+
+
 def send_to_conductor(
     session: str,
     message: str,
@@ -609,6 +615,7 @@ def send_to_conductor(
     response_timeout: int = RESPONSE_TIMEOUT,
     reply_callback: ReplyCallback | None = None,
     force_queue: bool = False,
+    source: str | None = None,
 ) -> tuple[bool, str, bool]:
     """Send a message to the conductor session.
 
@@ -631,7 +638,7 @@ def send_to_conductor(
         # force_queue: caller already confirmed conductor is busy — skip status check.
         if force_queue:
             log.info("Conductor %s: force-queueing message", session)
-            _enqueue_message(session, message, profile, reply_callback)
+            _enqueue_message(session, message, profile, reply_callback, source)
             return True, "", False
 
         # For non-blocking sends (user messages), check if conductor is busy
@@ -641,11 +648,12 @@ def send_to_conductor(
             log.info(
                 "Conductor %s is busy (%s), queueing message", session, status,
             )
-            _enqueue_message(session, message, profile, reply_callback)
+            _enqueue_message(session, message, profile, reply_callback, source)
             return True, "", False  # queued, not failed
 
         result = run_cli(
             "session", "send", session, message, "--no-wait",
+            *_from_args(source),
             profile=profile, timeout=30,
         )
         if result.returncode != 0:
@@ -657,7 +665,7 @@ def send_to_conductor(
                     "Conductor %s became busy during send, queueing message",
                     session,
                 )
-                _enqueue_message(session, message, profile, reply_callback)
+                _enqueue_message(session, message, profile, reply_callback, source)
                 return True, "", False
             log.error("Failed to send to conductor: %s", stderr)
             return False, "", False
@@ -671,6 +679,7 @@ def send_to_conductor(
     result = run_cli(
         "session", "send", session, message,
         "--wait", "--timeout", f"{response_timeout}s", "-q",
+        *_from_args(source),
         profile=profile,
         timeout=max(response_timeout + 30, 60),
     )
@@ -701,7 +710,7 @@ MAX_QUEUE_DEPTH = 20
 # In-memory queue: {session_title: deque[(message, profile, reply_callback), ...]}
 # reply_callback is an optional ReplyCallback that notifies the originating user
 # when the queued message is eventually delivered.
-_message_queue: dict[str, deque[tuple[str, str | None, ReplyCallback | None]]] = {}
+_message_queue: dict[str, deque[tuple[str, str | None, ReplyCallback | None, str | None]]] = {}
 _drain_task: asyncio.Task | None = None
 
 
@@ -710,6 +719,7 @@ def _enqueue_message(
     message: str,
     profile: str | None,
     reply_callback: ReplyCallback | None = None,
+    source: str | None = None,
 ) -> None:
     """Add a message to the in-memory queue for a busy conductor.
 
@@ -725,7 +735,7 @@ def _enqueue_message(
             "Queue full for %s (depth=%d), dropping oldest message",
             session, MAX_QUEUE_DEPTH,
         )
-        _msg, _prof, dropped_cb = queue.popleft()
+        _msg, _prof, dropped_cb, _src = queue.popleft()
         if dropped_cb is not None:
             try:
                 loop = asyncio.get_running_loop()
@@ -735,7 +745,7 @@ def _enqueue_message(
                 ))
             except RuntimeError:
                 pass  # no event loop available, can't fire async callback
-    queue.append((message, profile, reply_callback))
+    queue.append((message, profile, reply_callback, source))
     log.info("Queued message for %s (queue depth: %d)", session, len(queue))
     _ensure_drain_task()
 
@@ -799,7 +809,7 @@ async def _drain_queue() -> None:
                 _message_queue.pop(session, None)
                 continue
 
-            message, profile, reply_callback = items[0]
+            message, profile, reply_callback, source = items[0]
             loop = asyncio.get_running_loop()
             status = await loop.run_in_executor(
                 None,
@@ -816,7 +826,7 @@ async def _drain_queue() -> None:
                     session, len(items),
                 )
                 dropped = _message_queue.pop(session, deque())
-                for _msg, _prof, cb in dropped:
+                for _msg, _prof, cb, _src in dropped:
                     if cb is not None:
                         loop.create_task(_fire_callback(
                             cb,
@@ -831,6 +841,7 @@ async def _drain_queue() -> None:
                     run_cli,
                     "session", "send", session, message,
                     "--wait", "--timeout", f"{RESPONSE_TIMEOUT}s", "-q",
+                    *_from_args(source),
                     profile=profile,
                     timeout=max(RESPONSE_TIMEOUT + 30, 60),
                 ),
@@ -1800,6 +1811,7 @@ def create_telegram_bot(config: dict):
                 wait_for_reply=False,
                 reply_callback=_tg_reply,
                 force_queue=True,
+                source="user:telegram",
             )
             if not ok:
                 await message.answer(
@@ -1823,6 +1835,7 @@ def create_telegram_bot(config: dict):
                 profile=target_profile,
                 wait_for_reply=True,
                 response_timeout=RESPONSE_TIMEOUT,
+                source="user:telegram",
             ),
         )
         if not ok:
@@ -2152,6 +2165,7 @@ def create_slack_app(config: dict):
                 session_title, cleaned_msg, profile=profile,
                 wait_for_reply=False, reply_callback=_slack_reply,
                 force_queue=True,
+                source="user:slack",
             )
             if not ok:
                 await _safe_say(
@@ -2175,6 +2189,7 @@ def create_slack_app(config: dict):
                 send_to_conductor,
                 session_title, cleaned_msg, profile=profile,
                 wait_for_reply=True, response_timeout=RESPONSE_TIMEOUT,
+                source="user:slack",
             ),
         )
         if not ok:
@@ -2760,6 +2775,7 @@ def create_discord_bot(config: dict):
             "Discord message -> [%s]: %s",
             target["name"], cleaned_msg[:100],
         )
+        dc_source = f"user:discord:{getattr(message.channel, 'name', None) or message.channel.id}"
         async with message.channel.typing():
             loop = asyncio.get_event_loop()
             ok, response, still_running = await loop.run_in_executor(
@@ -2770,6 +2786,7 @@ def create_discord_bot(config: dict):
                     profile=profile,
                     wait_for_reply=True,
                     response_timeout=RESPONSE_TIMEOUT,
+                    source=dc_source,
                 ),
             )
         if not ok:
@@ -3051,6 +3068,7 @@ async def heartbeat_loop(
                         profile=profile,
                         wait_for_reply=True,
                         response_timeout=RESPONSE_TIMEOUT,
+                        source="bridge:heartbeat",
                     ),
                 )
                 if not ok:
@@ -3637,6 +3655,7 @@ async def _deliver_watcher_event(
         functools.partial(
             send_to_conductor, session_title, msg,
             profile=profile, wait_for_reply=False,
+            source="bridge:watcher",
         ),
     )
     if ok:
