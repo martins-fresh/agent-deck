@@ -112,7 +112,12 @@ type MsgProvenanceRecord struct {
 	Source   string   `json:"source"`
 	Class    MsgClass `json:"class"`
 	Mode     string   `json:"mode,omitempty"`
-	Preview  string   `json:"preview"`
+	// Decision records the send-policy outcome: "allow", "blocked-allowlist",
+	// "blocked-elevated", or "warned-elevated". Empty for plain allow.
+	Decision string `json:"decision,omitempty"`
+	// Reason is a human-readable explanation when Decision is a block/warn.
+	Reason  string `json:"reason,omitempty"`
+	Preview string `json:"preview"`
 }
 
 // MessageProvenanceLogPath is the JSONL provenance log, resolved against the

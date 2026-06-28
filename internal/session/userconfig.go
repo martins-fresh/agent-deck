@@ -719,6 +719,10 @@ type ConductorOverrides struct {
 	Claude ConductorClaudeSettings `toml:"claude,omitempty"`
 	// Hermes defines Hermes overrides for a specific conductor.
 	Hermes ConductorHermesSettings `toml:"hermes,omitempty"`
+	// SendPolicy overrides the send-authority guards for this conductor only.
+	// Only AllowedSenders is honored here (replaces the global allowlist for
+	// this target); the elevated-authorization gate is global-only.
+	SendPolicy SendPolicy `toml:"send_policy,omitempty"`
 }
 
 // ConductorClaudeSettings defines conductor-specific Claude overrides.

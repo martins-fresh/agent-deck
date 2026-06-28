@@ -112,6 +112,11 @@ type ConductorSettings struct {
 	// 'conductor migrate-dir'). The bridge daemon similarly freezes
 	// AGENT_DECK_CONDUCTOR_DIR at install time.
 	Dir string `toml:"dir,omitempty"`
+
+	// SendPolicy holds the global conductor send-authority guards
+	// ([conductor.send_policy]): the peer-sender allowlist and the
+	// elevated-authorization gate. Opt-in — a zero value enforces nothing.
+	SendPolicy SendPolicy `toml:"send_policy,omitempty"`
 }
 
 // TelegramSettings defines Telegram bot configuration for the conductor bridge

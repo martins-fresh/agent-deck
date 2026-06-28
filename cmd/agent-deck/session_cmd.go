@@ -2204,6 +2204,38 @@ func handleSessionSend(profile string, args []string) {
 	} else if *draft {
 		deliveryMode = "draft"
 	}
+
+	// Send-policy guards (opt-in; only apply to conductor targets). Run on the
+	// ORIGINAL message text and BEFORE the provenance tag is prepended.
+	decision, reason := "allow", ""
+	warnTag := ""
+	blocked := false
+	if inst.IsConductor || strings.HasPrefix(inst.Title, session.ConductorSessionTitlePrefix) {
+		conductorName := strings.TrimPrefix(inst.Title, session.ConductorSessionTitlePrefix)
+		// Fail open if config is unreadable — never break sends on a config error.
+		cfg, _ := session.LoadUserConfig()
+		pol := session.ResolveSendPolicy(cfg, conductorName)
+
+		// 1. Allowlist: may this peer source message this conductor at all?
+		if ok, why := pol.CheckAllowed(msgClass, msgSource); !ok {
+			decision, reason, blocked = "blocked-allowlist", why, true
+		}
+
+		// 2. Elevated-authorization gate: merge/irreversible authorizations must
+		// come from a verified user channel. Only user-class traffic is trusted.
+		if !blocked && pol.ElevatedMode() != "off" && msgClass != session.MsgClassUser {
+			if hit, pat := pol.MatchElevated(message); hit {
+				reason = fmt.Sprintf("elevated authorization (matched %s) from non-user source %q", pat, msgSource)
+				if pol.ElevatedMode() == "block" {
+					decision, blocked = "blocked-elevated", true
+				} else {
+					decision = "warned-elevated"
+					warnTag = session.ElevatedUnverifiedTag(msgSource)
+				}
+			}
+		}
+	}
+
 	session.LogMessageProvenance(session.MsgProvenanceRecord{
 		TS:       time.Now().UTC().Format(time.RFC3339),
 		Target:   inst.Title,
@@ -2211,10 +2243,34 @@ func handleSessionSend(profile string, args []string) {
 		Source:   msgSource,
 		Class:    msgClass,
 		Mode:     deliveryMode,
+		Decision: decision,
+		Reason:   reason,
 		Preview:  session.MessagePreview(message, 200),
 	})
+
+	if blocked {
+		out.ErrorWithData(
+			fmt.Sprintf("send to '%s' blocked by conductor send_policy: %s", inst.Title, reason),
+			ErrCodeInvalidOperation,
+			map[string]interface{}{
+				"blocked":  true,
+				"decision": decision,
+				"reason":   reason,
+				"source":   msgSource,
+				"class":    string(msgClass),
+				"target":   inst.Title,
+			},
+		)
+		os.Exit(1)
+	}
+
+	// Prepend tags: the provenance [from: ...] tag, then (outermost, so it leads)
+	// the loud UNVERIFIED authorization warning when in warn mode.
 	if tag := session.MessageProvenanceTag(msgSource, msgClass); tag != "" {
 		message = tag + message
+	}
+	if warnTag != "" {
+		message = warnTag + message
 	}
 
 	// Get tmux session
