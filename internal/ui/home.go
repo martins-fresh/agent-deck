@@ -5870,6 +5870,7 @@ type sessionRenderState struct {
 	// callers that build a fake snapshot without touching this field (many
 	// tests do) get the pre-finding-1 behavior of counting everything.
 	archivedSuperseded bool
+	model          string // Display label for the model in effect (LiveModelInfo), "" if unknown
 }
 
 // shouldPersistAutoNameDesc decides whether the background status loop should
@@ -6031,6 +6032,11 @@ func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
 			title:        inst.GetTitleThreadSafe(),
 			autoName:     inst.GetAutoName(),
 			autoNameDesc: inst.GetAutoNameDescription(),
+			// LiveModelInfo does a bounded tail-read of the session's JSONL,
+			// cached by path+mtime — cheap here (this refresher's own
+			// goroutine, off the render path) but still real file I/O, so it
+			// stays on this periodic cadence rather than running per-frame.
+			model: inst.LiveModelInfo().Display(),
 		}
 		// Look up pane title from the already-refreshed tmux cache.
 		// Only RefreshPaneInfoCache (called from backgroundStatusUpdate) keeps
@@ -6083,6 +6089,7 @@ func (h *Home) getSessionRenderState(inst *session.Instance) sessionRenderState 
 		title:          inst.GetTitleThreadSafe(),
 		autoName:       inst.GetAutoName(),
 		autoNameDesc:   inst.GetAutoNameDescription(),
+		model:          inst.LiveModelInfo().Display(),
 	}
 }
 
@@ -21864,6 +21871,20 @@ func (h *Home) renderSessionItem(
 	tool := toolStyle.Render(" " + instTool)
 	if listWidth > 0 && listWidth < 40 {
 		tool = ""
+	}
+	// Model badge (#…): "claude" alone doesn't say which model answered.
+	// instState.model is LiveModelInfo().Display() from the render snapshot —
+	// the model actually seen in the session's transcript, falling back to any
+	// explicit --model override, empty when neither is known (e.g. session
+	// hasn't produced a transcript line yet). Folded into `tool` itself, not a
+	// separate variable, so it's automatically covered by the width-budget
+	// accounting below that sums cellWidth(tool).
+	dimStyle := DimStyle
+	if selected {
+		dimStyle = toolStyle
+	}
+	if instState.model != "" && !(listWidth > 0 && listWidth < 40) {
+		tool += dimStyle.Render(" · " + instState.model)
 	}
 
 	// Supervisor badge for the maestro row.
