@@ -1642,6 +1642,17 @@ type NotificationsConfig struct {
 	// Per-session override: Instance.NoTransitionNotify
 	TransitionEvents *bool `toml:"transition_events,omitempty"`
 
+	// AutoArchiveCompletedChildren archives a worker session (one with a
+	// non-empty ParentSessionID) as soon as it emits the AGENTDECK_DONE
+	// sentinel and its ledger entry is written. Default: true (nil = true) —
+	// a finished one-off worker sitting around forever looks identical to a
+	// genuinely stuck one to anything counting "needs attention" (e.g. the
+	// conductor heartbeat's --attention gate), so archiving on completion is
+	// the safe default. Set to false to leave completed workers for the user
+	// to archive manually. Top-level/conductor sessions (empty
+	// ParentSessionID) are never touched by this regardless of the setting.
+	AutoArchiveCompletedChildren *bool `toml:"auto_archive_completed_children,omitempty"`
+
 	// Desktop raises an OS notification (cmux's notification panel when
 	// available, otherwise a macOS banner) when a session starts waiting for
 	// input or errors out.
@@ -1668,6 +1679,15 @@ func (n NotificationsConfig) GetTransitionEventsEnabled() bool {
 		return true
 	}
 	return *n.TransitionEvents
+}
+
+// GetAutoArchiveCompletedChildrenEnabled returns whether a worker session
+// should be auto-archived on completion. Defaults to true when unset (nil).
+func (n NotificationsConfig) GetAutoArchiveCompletedChildrenEnabled() bool {
+	if n.AutoArchiveCompletedChildren == nil {
+		return true
+	}
+	return *n.AutoArchiveCompletedChildren
 }
 
 // InstanceSettings configures multiple agent-deck instance behavior

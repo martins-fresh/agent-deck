@@ -2070,6 +2070,58 @@ transition_events = false
 	}
 }
 
+func TestUserConfig_AutoArchiveCompletedChildrenDefault(t *testing.T) {
+	tmpDir := t.TempDir()
+	configContent := `
+[notifications]
+enabled = true
+`
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	if config.Notifications.AutoArchiveCompletedChildren != nil {
+		t.Errorf("AutoArchiveCompletedChildren should be nil when not set, got %v", *config.Notifications.AutoArchiveCompletedChildren)
+	}
+	if !config.Notifications.GetAutoArchiveCompletedChildrenEnabled() {
+		t.Error("GetAutoArchiveCompletedChildrenEnabled() should return true when nil")
+	}
+}
+
+func TestUserConfig_AutoArchiveCompletedChildrenExplicitFalse(t *testing.T) {
+	tmpDir := t.TempDir()
+	configContent := `
+[notifications]
+enabled = true
+auto_archive_completed_children = false
+`
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	if config.Notifications.AutoArchiveCompletedChildren == nil {
+		t.Fatal("AutoArchiveCompletedChildren should not be nil when explicitly set")
+	}
+	if *config.Notifications.AutoArchiveCompletedChildren != false {
+		t.Error("AutoArchiveCompletedChildren should be false when explicitly set to false")
+	}
+	if config.Notifications.GetAutoArchiveCompletedChildrenEnabled() {
+		t.Error("GetAutoArchiveCompletedChildrenEnabled() should return false when explicitly false")
+	}
+}
+
 // TestGetActiveFilterExcludes verifies the % filter's exclude-set resolution:
 // the default ({error, stopped}) matches the original upstream hardcoded
 // behavior so existing users see no behavior change unless they opt in.

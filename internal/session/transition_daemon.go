@@ -15,6 +15,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/desknotify"
 	"github.com/asheshgoplani/agent-deck/internal/health"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 const (
@@ -978,7 +979,68 @@ func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Inst
 			Summary:    sig.Summary,
 			FinishedAt: hs.UpdatedAt,
 		})
+
+		// Auto-archive a finished worker so it stops looking identical to a
+		// genuinely stuck session to anything counting "needs attention"
+		// (notably the conductor heartbeat's --attention gate, session#issue
+		// "heartbeat fires forever because a done worker was never archived").
+		// Only ever a worker (non-empty ParentSessionID) — a top-level or
+		// conductor session finishing its own turn is not "done" in this
+		// sense and must never be auto-archived.
+		if strings.TrimSpace(inst.ParentSessionID) != "" && GetNotificationsSettings().GetAutoArchiveCompletedChildrenEnabled() {
+			d.autoArchiveCompletedChild(profile, inst)
+		}
 	}
+}
+
+// autoArchiveCompletedChild archives a worker instance that just emitted its
+// done sentinel. Mirrors persistArchivedCLI's targeted-UPDATE approach
+// (cmd/agent-deck/session_cmd.go): a full save would fight a concurrently
+// running TUI's external-change guard, so this only touches the archived-at
+// and (if it killed a live session) status columns. Best-effort: failures are
+// logged, never fatal to the poll loop — a missed auto-archive just leaves
+// the worker for the user to archive manually, same as today.
+func (d *TransitionDaemon) autoArchiveCompletedChild(profile string, inst *Instance) {
+	if inst == nil || inst.IsArchived() {
+		return
+	}
+	storage := d.getStorage(profile)
+	if storage == nil {
+		return
+	}
+	db := storage.GetDB()
+	if db == nil {
+		return
+	}
+
+	persistStatus := false
+	if inst.Exists() {
+		if err := inst.Kill(); err != nil {
+			slog.Warn("auto-archive: failed to kill completed worker's tmux session",
+				"session_id", inst.ID, "title", inst.Title, "error", err)
+			// Continue anyway — archiving a session whose process we couldn't
+			// kill is still better than leaving it looking "needs attention".
+		} else {
+			persistStatus = true
+		}
+	}
+
+	inst.ArchivedAt = time.Now().UTC()
+
+	if persistStatus {
+		if err := db.PersistInstanceStatusesTx([]statedb.InstanceStatusUpdate{
+			{ID: inst.ID, Status: string(inst.Status)},
+		}); err != nil {
+			slog.Warn("auto-archive: failed to persist post-kill status",
+				"session_id", inst.ID, "title", inst.Title, "error", err)
+		}
+	}
+	if err := db.SetArchived(inst.ID, inst.ArchivedAt); err != nil {
+		slog.Warn("auto-archive: failed to persist archived-at",
+			"session_id", inst.ID, "title", inst.Title, "error", err)
+		return
+	}
+	slog.Info("auto-archived completed worker", "session_id", inst.ID, "title", inst.Title)
 }
 
 // doneSignalFor resolves a hook status into a completion sentinel, or reports
