@@ -5870,7 +5870,7 @@ type sessionRenderState struct {
 	// callers that build a fake snapshot without touching this field (many
 	// tests do) get the pre-finding-1 behavior of counting everything.
 	archivedSuperseded bool
-	model          string // Display label for the model in effect (LiveModelInfo), "" if unknown
+	model              string // Display label for the model in effect (LiveModelInfo), "" if unknown
 }
 
 // shouldPersistAutoNameDesc decides whether the background status loop should
@@ -21872,19 +21872,24 @@ func (h *Home) renderSessionItem(
 	if listWidth > 0 && listWidth < 40 {
 		tool = ""
 	}
-	// Model badge (#…): "claude" alone doesn't say which model answered.
-	// instState.model is LiveModelInfo().Display() from the render snapshot —
+	// Model badge — "claude" alone doesn't say which model answered.
+	// instState.model is LiveModelInfo().Display() from the render snapshot:
 	// the model actually seen in the session's transcript, falling back to any
 	// explicit --model override, empty when neither is known (e.g. session
-	// hasn't produced a transcript line yet). Folded into `tool` itself, not a
-	// separate variable, so it's automatically covered by the width-budget
-	// accounting below that sums cellWidth(tool).
+	// hasn't produced a transcript line yet).
+	//
+	// Deliberately not folded into `tool` before the fixed reservation: the
+	// session name is the primary identifier, and a long model ID
+	// (" · claude-opus-5") used to consume the title's budget on a narrow
+	// SESSIONS pane until every row collapsed to "…". The suffix is appended
+	// only when the title still gets minSessionTitleWidth after it.
 	dimStyle := DimStyle
 	if selected {
 		dimStyle = toolStyle
 	}
+	modelSuffix := ""
 	if instState.model != "" && !(listWidth > 0 && listWidth < 40) {
-		tool += dimStyle.Render(" · " + instState.model)
+		modelSuffix = dimStyle.Render(" · " + instState.model)
 	}
 
 	// Supervisor badge for the maestro row.
@@ -22047,6 +22052,20 @@ func (h *Home) renderSessionItem(
 		cellWidth(maestroBadge) + cellWidth(yoloBadge) + cellWidth(worktreeBadge) +
 		cellWidth(sandboxBadge) + cellWidth(multiRepoBadge) + cellWidth(sshBadge) +
 		cellWidth(agentBadge) + cellWidth(timestampBadge)
+	// The model badge is optional and yields to the session name: include it
+	// only when the title still gets minSessionTitleWidth after the badge and
+	// the account badge's full width (the widest it can be — fit() only ever
+	// shrinks it). Measuring against the full account width is deliberately
+	// conservative, so the badge drops before the title is starved.
+	if modelSuffix != "" && listWidth > 0 {
+		titleRoom := listWidth - reserved - instState.accountDisplay.width - 1
+		if titleRoom-cellWidth(modelSuffix) < minSessionTitleWidth {
+			modelSuffix = ""
+		}
+	}
+	tool += modelSuffix
+	reserved += cellWidth(modelSuffix)
+
 	// Keep a useful title before spending narrow-row space on a worktree badge.
 	if listWidth > 0 && listWidth < 40 && worktreeBadge != "" {
 		originalWidth := cellWidth(worktreeBadge)

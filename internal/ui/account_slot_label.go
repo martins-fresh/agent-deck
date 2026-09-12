@@ -32,12 +32,22 @@ func newAccountPresentation(account string, slotsConfigured bool) accountPresent
 		return accountPresentation{}
 	}
 	label := storedAccountLabel(account)
-	return accountPresentation{
+	p := accountPresentation{
 		label:  label,
 		badge:  storedAccountPrefix + label + "]",
 		width:  len(storedAccountPrefix) + cellWidth(label) + 1,
 		quoted: account != "",
 	}
+	// An empty slot means "ambient/default login", not a stored slot. Rendering
+	// "[account:inherited]" on every such row repeats one low-information value
+	// across the list and spends ~20 cells the session name needs more — the
+	// slot badge only earns its place when it distinguishes named slots. The
+	// label stays populated for the info card, where the field has context.
+	if !p.quoted {
+		p.badge = ""
+		p.width = 0
+	}
+	return p
 }
 
 // Quote before styling/truncation so terminal controls cannot become commands.
