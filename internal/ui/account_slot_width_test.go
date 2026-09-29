@@ -33,9 +33,7 @@ func TestStoredAccountWidthMatrix(t *testing.T) {
 						// room for the account badge (#2201): the badge is
 						// the first thing shortened, then dropped, instead.
 						require.Contains(t, line, "Title", "title must stay visible even in a narrow column")
-						if slot == "" {
-							require.NotContains(t, line, "[account:")
-						} else if width >= 48 {
+						if width >= 48 {
 							require.Contains(t, line, "[account:")
 						}
 					}

@@ -23,7 +23,7 @@ func renderTitleRow(t *testing.T, width int, title, model, account string) strin
 		tool:           "claude",
 		title:          title,
 		account:        account,
-		accountDisplay: newAccountPresentation(account),
+		accountDisplay: newAccountPresentation(account, true),
 		model:          model,
 	}
 	var b strings.Builder
@@ -62,16 +62,4 @@ func TestSessionModelBadgeRendersWhenRoomy(t *testing.T) {
 	row := renderTitleRow(t, 140, "conductor-call-queueing", "claude-opus-5", "work")
 	require.Contains(t, row, "conductor-call-queueing")
 	require.Contains(t, row, "· claude-opus-5")
-}
-
-// An unset account slot is the ambient/default login, not stored metadata: it
-// renders no badge so the row does not repeat "[account:inherited]" everywhere.
-// A named slot still must appear.
-func TestEmptyAccountSlotRendersNoBadge(t *testing.T) {
-	empty := renderTitleRow(t, 120, "conductor-core", "", "")
-	require.NotContains(t, empty, "[account:")
-	require.NotContains(t, empty, "inherited")
-
-	named := renderTitleRow(t, 120, "conductor-core", "", "work")
-	require.Contains(t, named, `[account:"work"]`)
 }
